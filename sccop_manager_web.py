@@ -1,132 +1,212 @@
-import subprocess
-import tkinter as tk
-from tkinter import messagebox, ttk
+"""Flask web version of the Scoop Manager GUI (filename typo kept for git history).
+
+Serves templates/index.html which expects these endpoints:
+  GET  /get_apps?page=&per_page=&search=
+  POST /install_app | /uninstall_app | /update_app   {json: {"app_name": "..."}}
+  POST /update_all
+  GET  /status      -> background-job progress/log for polling clients
+"""
+
+import json
+import os
+import sqlite3
+import threading
+
+from flask import Flask, flash, get_flashed_messages, jsonify, render_template, request
+
+import scoop_core
 from scoop_app_fetcher import ScoopAppFetcher
 
-class ScoopManagerApp(tk.Tk):
-    def __init__(self):
-        super().__init__()
-        self.title("Scoop Manager")
-        self.geometry("1000x600")
-        self.fetcher = ScoopAppFetcher()
-        self.create_widgets()
-        self.refresh_apps()
+FALLBACK_CACHE_FILE = "scoop_cache.json"
 
-    def create_widgets(self):
-        self.grid_columnconfigure(0, weight=1)
-        self.grid_columnconfigure(1, weight=3)
-        self.grid_rowconfigure(1, weight=1)
+app = Flask(__name__)
+app.secret_key = os.environ.get("SCOOP_MANAGER_SECRET", "scoop-manager-dev-key")
 
-        # Search box
-        self.search_var = tk.StringVar()
-        self.search_entry = tk.Entry(self, textvariable=self.search_var, font=('Arial', 14), width=80)
-        self.search_entry.grid(row=0, column=0, columnspan=2, padx=10, pady=10, sticky="ew")
-        self.search_entry.bind('<KeyRelease>', self.update_app_list)
+_fetcher = None
+_fetcher_lock = threading.Lock()
 
-        # Sidebar - List of installed apps
-        sidebar_frame = tk.Frame(self)
-        sidebar_frame.grid(row=1, column=0, sticky="nswe", padx=10, pady=10)
-        sidebar_frame.grid_rowconfigure(0, weight=1)
 
-        tk.Label(sidebar_frame, text="Installed Applications", font=('Arial', 14)).pack(anchor='w')
-        self.installed_apps_listbox = tk.Listbox(sidebar_frame, height=20, font=('Arial', 12))
-        self.installed_apps_listbox.pack(fill='both', expand=True, pady=5)
+def get_fetcher():
+    global _fetcher
+    with _fetcher_lock:
+        if _fetcher is None:
+            _fetcher = ScoopAppFetcher()
+            try:
+                _fetcher.update_data()
+            except Exception:
+                pass  # offline -> fall back to cache/catalog below
+        return _fetcher
 
-        # Main content - List of available apps
-        main_frame = tk.Frame(self)
-        main_frame.grid(row=1, column=1, sticky="nswe", padx=10, pady=10)
-        main_frame.grid_rowconfigure(0, weight=1)
-        main_frame.grid_columnconfigure(0, weight=1)
 
-        self.available_apps_tree = ttk.Treeview(main_frame, columns=('Name', 'Description', 'Status'), show='headings', height=20)
-        self.available_apps_tree.heading('Name', text='Name', command=lambda: self.sort_column('Name', False))
-        self.available_apps_tree.heading('Description', text='Description', command=lambda: self.sort_column('Description', False))
-        self.available_apps_tree.heading('Status', text='Status', command=lambda: self.sort_column('Status', False))
-        self.available_apps_tree.column('Name', width=200)
-        self.available_apps_tree.column('Description', width=400)
-        self.available_apps_tree.column('Status', width=100)
-        self.available_apps_tree.pack(fill='both', expand=True)
+# ---------------------------------------------------------------------------
+# Background job registry (one long-running scoop command at a time)
+# ---------------------------------------------------------------------------
 
-        # Install and uninstall buttons
-        button_frame = tk.Frame(self)
-        button_frame.grid(row=2, column=0, columnspan=2, pady=10)
+_job_lock = threading.Lock()
+_job = {"running": False, "label": "", "log": [], "returncode": None}
 
-        self.install_button = tk.Button(button_frame, text="Install", command=self.install_selected_app)
-        self.install_button.pack(side='left', padx=10)
 
-        self.uninstall_button = tk.Button(button_frame, text="Uninstall", command=self.uninstall_selected_app)
-        self.uninstall_button.pack(side='left', padx=10)
+def start_job(label, argv):
+    """Start a scoop command in the background. Returns False if one is running."""
+    with _job_lock:
+        if _job["running"]:
+            return False
+        _job.update(running=True, label=label, log=[], returncode=None)
 
-        self.refresh_button = tk.Button(button_frame, text="Refresh", command=self.refresh_apps)
-        self.refresh_button.pack(side='left', padx=10)
+    def on_line(line):
+        with _job_lock:
+            _job["log"].append(line)
 
-    def refresh_apps(self):
-        self.available_apps = self.fetcher.get_apps_info(['Name', 'Description'])
-        self.installed_apps = self.get_installed_apps()
-        self.update_app_list()
-        self.update_installed_app_list()
+    def on_finish(returncode):
+        with _job_lock:
+            _job["returncode"] = returncode
+            _job["running"] = False
 
-    def update_app_list(self, event=None):
-        search_query = self.search_var.get().lower()
-        filtered_apps = [app for app in self.available_apps if search_query in app['Name'].lower()]
-        self.available_apps_tree.delete(*self.available_apps_tree.get_children())
-        for app in filtered_apps:
-            self.available_apps_tree.insert('', 'end', values=(app['Name'], app['Description'], 'Installed' if app['Name'] in self.installed_apps else 'Available'))
+    scoop_core.stream_scoop_async(argv, on_line=on_line, on_finish=on_finish)
+    return True
 
-    def update_installed_app_list(self):
-        self.installed_apps_listbox.delete(0, tk.END)
-        for app in self.installed_apps:
-            self.installed_apps_listbox.insert(tk.END, app)
 
-    def install_selected_app(self):
-        selected_item = self.available_apps_tree.selection()
-        if selected_item:
-            app_name = self.available_apps_tree.item(selected_item, 'values')[0]
-            self.install_app(app_name)
-            self.refresh_apps()
+# ---------------------------------------------------------------------------
+# Catalog helpers
+# ---------------------------------------------------------------------------
 
-    def uninstall_selected_app(self):
-        selected_app = self.installed_apps_listbox.get(tk.ACTIVE)
-        if selected_app:
-            self.uninstall_app(selected_app)
-            self.refresh_apps()
+def load_fallback_catalog():
+    """Offline fallback list of apps from the repo's scoop_cache.json."""
+    try:
+        with open(FALLBACK_CACHE_FILE, 'r') as cache_file:
+            raw = json.load(cache_file)
+        return [{
+            "Name": entry.get("App Name", ""),
+            "Description": entry.get("Description", ""),
+            "Version": entry.get("Version", ""),
+            "committed": "",
+        } for entry in raw if isinstance(entry, dict)]
+    except (OSError, ValueError):
+        return []
 
-    def install_app(self, app_name):
-        try:
-            result = subprocess.run(f'scoop install {app_name}', shell=True, check=True, capture_output=True, text=True)
-            messagebox.showinfo("Success", f"{app_name} installed successfully.")
-        except subprocess.CalledProcessError as e:
-            messagebox.showerror("Error", f"Failed to install {app_name}: {e.stderr}")
 
-    def uninstall_app(self, app_name):
-        try:
-            result = subprocess.run(f'scoop uninstall {app_name}', shell=True, check=True, capture_output=True, text=True)
-            messagebox.showinfo("Success", f"{app_name} uninstalled successfully.")
-        except subprocess.CalledProcessError as e:
-            messagebox.showerror("Error", f"Failed to uninstall {app_name}: {e.stderr}")
+def get_available_rows(page, per_page, search_query):
+    """Rows for the available-apps table: DB first, cached catalog fallback."""
+    columns = ["Name", "Description", "Version", "Committed"]
+    rows = []
+    try:
+        rows = get_fetcher().get_apps_info_paginated(columns, page, per_page, search_query)
+    except (sqlite3.Error, KeyError):
+        rows = []
+    normalized = [{
+        "Name": row.get("Name", ""),
+        "Description": row.get("Description", ""),
+        "Version": row.get("Version", "") or "",
+        "committed": str(row.get("Committed", "") or ""),
+    } for row in rows]
 
-    def sort_column(self, col, reverse):
-        l = [(self.available_apps_tree.set(k, col), k) for k in self.available_apps_tree.get_children('')]
-        l.sort(reverse=reverse)
+    if normalized:
+        return normalized
 
-        for index, (val, k) in enumerate(l):
-            self.available_apps_tree.move(k, '', index)
+    catalog = load_fallback_catalog()
+    if search_query:
+        needle = search_query.lower()
+        catalog = [entry for entry in catalog if needle in entry["Name"].lower()]
+    offset = max(page - 1, 0) * per_page
+    return catalog[offset:offset + per_page]
 
-        self.available_apps_tree.heading(col, command=lambda: self.sort_column(col, not reverse))
 
-    def get_installed_apps(self):
-        try:
-            result = subprocess.run('scoop list', shell=True, capture_output=True, text=True)
-            if result.returncode == 0:
-                apps = result.stdout.splitlines()
-                return apps
-            else:
-                messagebox.showerror("Error", f"Failed to fetch installed apps: {result.stderr}")
-                return []
-        except Exception as e:
-            messagebox.showerror("Error", f"Failed to fetch installed apps: {str(e)}")
-            return []
+def get_installed_rows():
+    """Normalized installed-app dicts; raises nothing."""
+    try:
+        return scoop_core.get_installed_apps()
+    except scoop_core.ScoopError:
+        return []
+
+
+# ---------------------------------------------------------------------------
+# Routes
+# ---------------------------------------------------------------------------
+
+@app.route("/")
+def index():
+    return render_template("index.html")
+
+
+@app.route("/get_apps")
+def get_apps():
+    try:
+        page = max(int(request.args.get("page", 1)), 1)
+        per_page = min(max(int(request.args.get("per_page", 50)), 1), 200)
+    except ValueError:
+        page, per_page = 1, 50
+    search_query = request.args.get("search", "").strip()
+
+    available = get_available_rows(page, per_page, search_query)
+    installed = get_installed_rows()
+
+    # Server-side status matching: case-insensitive exact name tokens,
+    # never raw-line substring comparison.
+    for entry in available:
+        entry["status"] = "Installed" if scoop_core.is_installed(entry["Name"], installed) else "Available"
+
+    return jsonify({
+        "page": page,
+        "installed_apps": [{
+            "Name": row["name"],
+            "Version": row.get("version", ""),
+            "Source": row.get("source", ""),
+            "Updated": row.get("updated", ""),
+            "Info": row.get("info", ""),
+        } for row in installed],
+        "available_apps": available,
+    })
+
+
+def _run_action(action_label, argv_builder, app_name):
+    if not app_name:
+        return jsonify(message="Missing app_name"), 400
+    if start_job(f"{action_label} {app_name}", argv_builder(app_name)):
+        flash(f"Started {action_label.lower()}ing {app_name}", "info")
+        return jsonify(message=f"{action_label} of {app_name} started")
+    return jsonify(message="Another operation is already running. Check the status panel."), 409
+
+
+@app.route("/install_app", methods=["POST"])
+def install_app_route():
+    data = request.get_json(silent=True) or {}
+    return _run_action("Install", scoop_core.cmd_install, str(data.get("app_name", "")).strip())
+
+
+@app.route("/uninstall_app", methods=["POST"])
+def uninstall_app_route():
+    data = request.get_json(silent=True) or {}
+    return _run_action("Uninstall", scoop_core.cmd_uninstall, str(data.get("app_name", "")).strip())
+
+
+@app.route("/update_app", methods=["POST"])
+def update_app_route():
+    data = request.get_json(silent=True) or {}
+    return _run_action("Update", scoop_core.cmd_update, str(data.get("app_name", "")).strip())
+
+
+@app.route("/update_all", methods=["POST"])
+def update_all_route():
+    if start_job("Update all apps", scoop_core.cmd_update_all()):
+        flash("Started updating all installed apps", "info")
+        return jsonify(message="Updating all apps...")
+    return jsonify(message="Another operation is already running. Check the status panel."), 409
+
+
+@app.route("/status")
+def status():
+    with _job_lock:
+        snapshot = {
+            "running": _job["running"],
+            "label": _job["label"],
+            "log": list(_job["log"]),
+            "returncode": _job["returncode"],
+        }
+    messages = [{"category": category, "text": text}
+                for category, text in get_flashed_messages(with_categories=True)]
+    snapshot["messages"] = messages
+    return jsonify(snapshot)
+
 
 if __name__ == "__main__":
-    app = ScoopManagerApp()
-    app.mainloop()
+    app.run(debug=True)

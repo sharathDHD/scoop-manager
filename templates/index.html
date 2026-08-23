@@ -96,10 +96,83 @@
     transition: all 250ms;
 }
 
-.pagination button:hover {
-    background-color: var(--button-hover-bg);
-    transform: scale(1.05) rotate(-1deg);
-}
+        .pagination button:hover {
+            background-color: var(--button-hover-bg);
+            transform: scale(1.05) rotate(-1deg);
+        }
+
+        .toolbar {
+            display: flex;
+            align-items: center;
+            justify-content: flex-end;
+            gap: 10px;
+            margin: 0 10px;
+        }
+
+        .toolbar button {
+            background-color: var(--button-bg);
+            border-radius: 100px;
+            padding: 7px 20px;
+            font-size: 16px;
+            cursor: pointer;
+            border: none;
+            transition: all 250ms;
+        }
+
+        .toolbar button:hover:not(:disabled) {
+            background-color: var(--button-hover-bg);
+            transform: scale(1.05) rotate(-1deg);
+        }
+
+        .toolbar button:disabled {
+            opacity: .5;
+            cursor: not-allowed;
+        }
+
+        .action-btn {
+            background-color: var(--button-bg);
+            color: #123;
+            border-radius: 100px;
+            padding: 4px 14px;
+            font-size: 12px;
+            cursor: pointer;
+            border: none;
+            transition: all 250ms;
+        }
+
+        .action-btn:hover:not(:disabled) {
+            background-color: var(--button-hover-bg);
+            transform: scale(1.05);
+        }
+
+        .action-btn:disabled {
+            opacity: .5;
+            cursor: not-allowed;
+        }
+
+        #status-panel {
+            position: fixed;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            max-height: 140px;
+            overflow-y: auto;
+            background: rgba(0, 0, 0, .55);
+            color: #e8ffe8;
+            font-family: 'Consolas', 'Courier New', monospace;
+            font-size: 12px;
+            padding: 8px 14px;
+            z-index: 50;
+            white-space: pre-wrap;
+        }
+
+        #status-panel .status-title {
+            font-weight: 500;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+            margin-bottom: 4px;
+        }
+
         
 
         table {
@@ -197,6 +270,9 @@
                 <input type="text" id="search" class="input-field" placeholder="Search for apps... " />
                 <div class="input-field-shadow"></div>
             </div>
+            <div class="toolbar">
+                <button id="update-all">Update All</button>
+            </div>
         </div>
         <div class="container">
             <div class="installed-table">
@@ -208,7 +284,7 @@
                                 <th>Version</th>
                                 <th>Source</th>
                                 <th>Updated</th>
-                                <th>Info</th>
+                                <th>Action</th>
                             </tr>
                         </thead>
                     </table>
@@ -249,30 +325,48 @@
     <script>
         let currentPage = 1;
         const perPage = 50;
+        let jobRunning = false;
+        let seenLogLines = 0;
+
+        function escapeHtml(value) {
+            return $('<div>').text(String(value ?? '')).html();
+        }
+
+        function appendStatusLine(line) {
+            const panel = $('#status-panel');
+            panel.append(`<div>${escapeHtml(line)}</div>`);
+            panel.scrollTop(panel[0].scrollHeight);
+        }
+
+        function setBusy(busy) {
+            jobRunning = busy;
+            $('.action-btn').prop('disabled', busy);
+            $('#update-all').prop('disabled', busy);
+        }
 
         function fetchApps(page = 1, search = '') {
-            $.get(`/get_apps?page=${page}&per_page=${perPage}&search=${search}`, function (data) {
+            $.get(`/get_apps?page=${page}&per_page=${perPage}&search=${encodeURIComponent(search)}`, function (data) {
                 const installedAppsHtml = data.installed_apps.map(app => `
                     <tr>
-                        <td>${app.Name}</td>
-                        <td>${app.Version}</td>
-                        <td>${app.Source}</td>
-                        <td>${app.Updated}</td>
-                        <td>${app.Info}</td>
+                        <td>${escapeHtml(app.Name)}</td>
+                        <td>${escapeHtml(app.Version)}</td>
+                        <td>${escapeHtml(app.Source)}</td>
+                        <td>${escapeHtml(app.Updated)}</td>
+                        <td><button class="action-btn" data-name="${escapeHtml(app.Name)}" data-action="update" ${jobRunning ? 'disabled' : ''}>Update</button></td>
                     </tr>
                 `).join('');
                 $('#installed-apps').html(installedAppsHtml);
 
+                // Status comes from the server (case-insensitive exact-name matching).
                 const availableAppsHtml = data.available_apps.map(app => {
-                    const status = data.installed_apps.some(installedApp => installedApp.Name === app.Name) ? 'Installed' : 'Available';
-                    const action = status === 'Installed' ? 'Uninstall' : 'Install';
+                    const action = app.status === 'Installed' ? 'Uninstall' : 'Install';
                     return `
                         <tr>
-                            <td>${app.Name}</td>
-                            <td>${app.Description}</td>
-                            <td>${app.Version}</td>
-                            <td>${app.committed}</td>
-                            <td><button class="action-btn" data-name="${app.Name}" data-action="${action.toLowerCase()}">${action}</button></td>
+                            <td>${escapeHtml(app.Name)}${app.status === 'Installed' ? ' <em>(installed)</em>' : ''}</td>
+                            <td>${escapeHtml(app.Description)}</td>
+                            <td><button class="action-btn" data-name="${escapeHtml(app.Name)}" data-action="${action.toLowerCase()}" ${jobRunning ? 'disabled' : ''}>${action}</button></td>
+                            <td>${escapeHtml(app.Version)}</td>
+                            <td>${escapeHtml(app.committed)}</td>
                         </tr>
                     `;
                 }).join('');
@@ -280,8 +374,53 @@
             });
         }
 
+        function pollStatus() {
+            $.get('/status', function (status) {
+                if (status.messages) {
+                    status.messages.forEach(msg => appendStatusLine(`[${msg.category}] ${msg.text}`));
+                }
+                const log = status.log || [];
+                for (; seenLogLines < log.length; seenLogLines++) {
+                    appendStatusLine(log[seenLogLines]);
+                }
+                if (status.running && !jobRunning) {
+                    setBusy(true);
+                    appendStatusLine(`>>> ${status.label}`);
+                } else if (!status.running && jobRunning) {
+                    const outcome = status.returncode === 0 ? 'completed successfully'
+                                                            : `failed (exit code ${status.returncode})`;
+                    appendStatusLine(`>>> ${status.label}: ${outcome}`);
+                    seenLogLines = log.length;
+                    setBusy(false);
+                    fetchApps(currentPage, $('#search').val().toLowerCase());
+                }
+            });
+        }
+
+        function runAction(actionUrl, payload) {
+            if (jobRunning) {
+                alert('Another operation is already running.');
+                return;
+            }
+            $.ajax({
+                url: actionUrl,
+                method: 'POST',
+                contentType: 'application/json',
+                data: JSON.stringify(payload),
+                success: function (response) {
+                    appendStatusLine(response.message);
+                    pollStatus();
+                },
+                error: function (xhr) {
+                    const message = (xhr.responseJSON && xhr.responseJSON.message) || 'Request failed.';
+                    alert(message);
+                }
+            });
+        }
+
         $(document).ready(function () {
             fetchApps();
+            setInterval(pollStatus, 1000);
 
             $('#search').on('keyup', function () {
                 fetchApps(1, $(this).val().toLowerCase());
@@ -290,21 +429,16 @@
             $(document).on('click', '.action-btn', function () {
                 const appName = $(this).data('name');
                 const action = $(this).data('action');
-                $.ajax({
-                    url: `/${action}_app`,
-                    method: 'POST',
-                    contentType: 'application/json',
-                    data: JSON.stringify({ app_name: appName }),
-                    success: function (response) {
-                        alert(response.message);
-                        fetchApps(currentPage, $('#search').val().toLowerCase());
-                    }
-                });
+                runAction(`/${action}_app`, { app_name: appName });
+            });
+
+            $('#update-all').on('click', function () {
+                runAction('/update_all', {});
             });
 
             $('#prev-page').on('click', function (e) {
                 e.preventDefault();
-                if (currentPage > 1) {
+                if (!jobRunning && currentPage > 1) {
                     currentPage--;
                     fetchApps(currentPage, $('#search').val().toLowerCase());
                 }
@@ -312,11 +446,14 @@
 
             $('#next-page').on('click', function (e) {
                 e.preventDefault();
-                currentPage++;
-                fetchApps(currentPage, $('#search').val().toLowerCase());
+                if (!jobRunning) {
+                    currentPage++;
+                    fetchApps(currentPage, $('#search').val().toLowerCase());
+                }
             });
         });
     </script>
+    <div id="status-panel"><div class="status-title">Scoop output</div></div>
 </body>
 
 </html>
